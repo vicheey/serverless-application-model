@@ -1,3 +1,7 @@
+Globals:
+  Api:
+    EndpointConfiguration: REGIONAL
+
 Resources:
   MyApi:
     Type: AWS::Serverless::Api
@@ -8,7 +12,7 @@ Resources:
         swagger: '2.0'
         info:
           version: '2016-09-23T22:23:23Z'
-          title: Simple Api
+          title: sam-integ-Simple-Api
         schemes:
         - https
         paths:
@@ -51,14 +55,14 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       InlineCode: |
-        exports.handler = async (event, context, callback) => {
+        exports.handler = async (event, context) => {
           return {
             statusCode: 200,
             body: 'Success'
           }
         }
       Handler: index.handler
-      Runtime: nodejs16.x
+      Runtime: nodejs22.x
       Events:
         LambdaRequest:
           Type: Api
@@ -94,9 +98,9 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Handler: index.handler
-      Runtime: nodejs16.x
+      Runtime: nodejs22.x
       InlineCode: |
-        exports.handler = async (event, context, callback) => {
+        exports.handler = async (event, context) => {
           const auth = event.queryStringParameters.authorization
           const policyDocument = {
             Version: '2012-10-17',

@@ -1,9 +1,5 @@
 Parameters:
-  PreCreatedSubnetOne:
-    Type: String
-  PreCreatedSubnetTwo:
-    Type: String
-  MskClusterName4:
+  PreCreatedMskClusterArn:
     Type: String
 
 Resources:
@@ -32,22 +28,6 @@ Resources:
       Tags:
       - {Value: SAM, Key: lambda:createdBy}
 
-  MyMskCluster:
-    Type: AWS::MSK::Cluster
-    Properties:
-      BrokerNodeGroupInfo:
-        ClientSubnets:
-        - Ref: PreCreatedSubnetOne
-        - Ref: PreCreatedSubnetTwo
-        InstanceType: kafka.t3.small
-        StorageInfo:
-          EBSStorageInfo:
-            VolumeSize: 1
-      ClusterName:
-        Ref: MskClusterName4
-      KafkaVersion: 3.8.x
-      NumberOfBrokerNodes: 2
-
   MyMskStreamProcessor:
     Type: AWS::Serverless::Function
     Properties:
@@ -60,13 +40,23 @@ Resources:
         MyMskEvent:
           Type: MSK
           Properties:
+            Enabled: false
             StartingPosition: LATEST
             Stream:
-              Ref: MyMskCluster
+              Ref: PreCreatedMskClusterArn
             Topics:
             - SchemaRegistryTestTopic
+            DestinationConfig:
+              OnFailure:
+                Type: Kafka
+                Destination: kafka://testTopic
             ProvisionedPollerConfig:
               MinimumPollers: 1
+            BisectBatchOnFunctionError: true
+            MaximumRecordAgeInSeconds: 3600
+            MaximumRetryAttempts: 3
+            FunctionResponseTypes:
+            - ReportBatchItemFailures
             SchemaRegistryConfig:
               AccessConfigs:
               - Type: BASIC_AUTH
@@ -75,8 +65,6 @@ Resources:
               - Attribute: KEY
               EventRecordFormat: JSON
               SchemaRegistryURI: https://confluent.us-east-2.aws.confluent.cloud:9092
-
-
 
   PreCreatedS3Bucket:
     Type: AWS::S3::Bucket

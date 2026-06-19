@@ -93,7 +93,7 @@ class BaseTest(TestCase):
         cls.tests_integ_dir = Path(__file__).resolve().parents[1]
         cls.resources_dir = Path(cls.tests_integ_dir, "resources")
         cls.template_dir = Path(cls.resources_dir, "templates")
-        cls.output_dir = Path(cls.tests_integ_dir, "tmp" + "-" + generate_suffix())
+        cls.output_dir = Path("/tmp", "tmp-" + generate_suffix())
         cls.expected_dir = Path(cls.resources_dir, "expected")
         cls.code_dir = Path(cls.resources_dir, "code")
         cls.session = boto3.session.Session()
@@ -127,8 +127,6 @@ class BaseTest(TestCase):
         if self.stack_name:
             client = self.client_provider.cfn_client
             client.delete_stack(StackName=self.stack_name)
-            waiter = client.get_waiter("stack_delete_complete")
-            waiter.wait(StackName=self.stack_name)
         if self.output_file_path and os.path.exists(self.output_file_path):
             os.remove(self.output_file_path)
         if self.sub_input_file_path and os.path.exists(self.sub_input_file_path):

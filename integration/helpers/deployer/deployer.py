@@ -116,7 +116,7 @@ class Deployer:
         :return:
         """
 
-        if type == "UPDATE":
+        if changeset_type == "UPDATE":
             # UsePreviousValue not valid if parameter is new
             summary = self._client.get_template_summary(StackName=stack_name)
             existing_parameters = [parameter["ParameterKey"] for parameter in summary["Parameters"]]
@@ -271,10 +271,8 @@ class Deployer:
             reason = resp.get("StatusReason", "")
 
             if (
-                status == "FAILED"
-                and "The submitted information didn't contain changes." in reason
-                or "No updates are to be performed" in reason
-            ):
+                status == "FAILED" and "The submitted information didn't contain changes." in reason
+            ) or "No updates are to be performed" in reason:
                 raise deploy_exceptions.ChangeEmptyError(stack_name=stack_name)
 
             raise deploy_exceptions.ChangeSetError(
@@ -373,6 +371,16 @@ class Deployer:
             self.describe_changeset(result["Id"], stack_name)
             return result
         except deploy_exceptions.ChangeEmptyError:
+            try:
+                # Delete the most recent change set that failed to create because it was empty
+                changeset = sorted(
+                    self._client.list_change_sets(StackName=stack_name).get("Summaries"),
+                    key=lambda c: c["CreationTime"],
+                )[-1]
+                if changeset.get("Status") == "FAILED" and changeset.get("ExecutionStatus") == "UNAVAILABLE":
+                    self._client.delete_change_set(ChangeSetName=changeset["ChangeSetId"], StackName=stack_name)
+            except Exception as ex:
+                LOG.warning("Failed to clean up empty changeset", exc_info=ex)
             return {}
         except botocore.exceptions.ClientError as ex:
             raise deploy_exceptions.DeployFailedError(stack_name=stack_name, msg=str(ex))

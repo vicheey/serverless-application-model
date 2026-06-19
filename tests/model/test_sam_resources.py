@@ -2,6 +2,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 import pytest
+from parameterized import parameterized
 from samtranslator.intrinsics.resolver import IntrinsicsResolver
 from samtranslator.model import InvalidResourceException, ResourceResolver
 from samtranslator.model.apigateway import ApiGatewayDeployment, ApiGatewayRestApi, ApiGatewayStage
@@ -11,6 +12,7 @@ from samtranslator.model.lambda_ import LambdaFunction, LambdaLayerVersion, Lamb
 from samtranslator.model.packagetype import IMAGE, ZIP
 from samtranslator.model.sam_resources import (
     SamApi,
+    SamCapacityProvider,
     SamConnector,
     SamFunction,
     SamGraphQLApi,
@@ -583,11 +585,29 @@ class TestFunctionUrlConfig(TestCase):
 
         cfnResources = function.to_cloudformation(**self.kwargs)
         generatedUrlList = [x for x in cfnResources if isinstance(x, LambdaPermission)]
-        self.assertEqual(generatedUrlList.__len__(), 1)
-        self.assertEqual(generatedUrlList[0].Action, "lambda:InvokeFunctionUrl")
-        self.assertEqual(generatedUrlList[0].FunctionName, {"Ref": "foo"})
-        self.assertEqual(generatedUrlList[0].Principal, "*")
-        self.assertEqual(generatedUrlList[0].FunctionUrlAuthType, "NONE")
+        self.assertEqual(generatedUrlList.__len__(), 2)
+        for permission in generatedUrlList:
+            self.assertEqual(permission.FunctionName, {"Ref": "foo"})
+            self.assertEqual(permission.Principal, "*")
+            self.assertTrue(permission.Action in ["lambda:InvokeFunctionUrl", "lambda:InvokeFunction"])
+            if permission.Action == "lambda:InvokeFunctionUrl":
+                self.assertEqual(permission.FunctionUrlAuthType, "NONE")
+            if permission.Action == "lambda:InvokeFunction":
+                self.assertEqual(permission.InvokedViaFunctionUrl, True)
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    def test_with_aws_iam_function_url_config_with_lambda_permission(self):
+        function = SamFunction("foo")
+        function.CodeUri = "s3://foobar/foo.zip"
+        function.Runtime = "foo"
+        function.Handler = "bar"
+        # When create FURL with AWS_IAM
+        function.FunctionUrlConfig = {"AuthType": "AWS_IAM"}
+
+        cfnResources = function.to_cloudformation(**self.kwargs)
+        generatedUrlList = [x for x in cfnResources if isinstance(x, LambdaPermission)]
+        # Then no permisssion should be auto created
+        self.assertEqual(generatedUrlList.__len__(), 0)
 
     @patch("boto3.session.Session.region_name", "ap-southeast-1")
     def test_with_invalid_function_url_config_with_authorization_type_value_as_None(self):
@@ -720,3 +740,286 @@ def test_function_datasource_set_with_none():
     api = SamGraphQLApi("MyApi")
     none_datasource = api._construct_none_datasource("foo")
     assert none_datasource
+
+
+class TestSamFunctionRoleResolver(TestCase):
+    """
+    Tests for resolving IAM role property values in SamFunction
+    """
+
+    def setUp(self):
+        self.function = SamFunction("foo")
+        self.function.CodeUri = "s3://foobar/foo.zip"
+        self.function.Runtime = "foo"
+        self.function.Handler = "bar"
+        self.kwargs = {
+            "intrinsics_resolver": IntrinsicsResolver({}),
+            "event_resources": [],
+            "managed_policy_map": {},
+            "resource_resolver": ResourceResolver({}),
+            "conditions": {"Conditions": {}},
+        }
+
+    def test_role_none_creates_execution_role(self):
+        self.function.Role = None
+        cfn_resources = self.function.to_cloudformation(**self.kwargs)
+        generated_roles = [x for x in cfn_resources if isinstance(x, IAMRole)]
+
+        self.assertEqual(len(generated_roles), 1)  # Should create execution role
+
+    def test_role_explicit_arn_no_execution_role(self):
+        test_role = "arn:aws:iam::123456789012:role/existing-role"
+        self.function.Role = test_role
+
+        cfn_resources = self.function.to_cloudformation(**self.kwargs)
+        generated_roles = [x for x in cfn_resources if isinstance(x, IAMRole)]
+        lambda_function = next(r for r in cfn_resources if r.resource_type == "AWS::Lambda::Function")
+
+        self.assertEqual(len(generated_roles), 0)  # Should not create execution role
+        self.assertEqual(lambda_function.Role, test_role)
+
+    def test_role_fn_if_no_aws_no_value_keeps_original(self):
+        role_conditional = {
+            "Fn::If": ["Condition", "arn:aws:iam::123456789012:role/existing-role", {"Ref": "iamRoleArn"}]
+        }
+        self.function.Role = role_conditional
+
+        kwargs = dict(self.kwargs)
+        kwargs["conditions"] = {"Condition": True}
+
+        cfn_resources = self.function.to_cloudformation(**self.kwargs)
+        generated_roles = [x for x in cfn_resources if isinstance(x, IAMRole)]
+        lambda_function = next(r for r in cfn_resources if r.resource_type == "AWS::Lambda::Function")
+
+        # Should not create a role if a role is passed in for both cases
+        self.assertEqual(len(generated_roles), 0)
+        self.assertEqual(lambda_function.Role, role_conditional)
+
+    def test_role_fn_if_both_no_value_creates_execution_role(self):
+        role_conditional = {"Fn::If": ["Condition", {"Ref": "AWS::NoValue"}, {"Ref": "AWS::NoValue"}]}
+        self.function.Role = role_conditional
+
+        kwargs = dict(self.kwargs)
+        kwargs["conditions"] = {"Condition": True}
+
+        cfn_resources = self.function.to_cloudformation(**self.kwargs)
+        generated_roles = [x for x in cfn_resources if isinstance(x, IAMRole)]
+
+        self.assertEqual(len(generated_roles), 1)
+
+    def test_role_fn_if_first_no_value_creates_conditional_role(self):
+        role_conditional = {"Fn::If": ["Condition", {"Ref": "AWS::NoValue"}, {"Ref": "iamRoleArn"}]}
+        self.function.Role = role_conditional
+
+        kwargs = dict(self.kwargs)
+        kwargs["conditions"] = {"Condition": True}
+
+        cfn_resources = self.function.to_cloudformation(**self.kwargs)
+        generated_roles = [x for x in cfn_resources if isinstance(x, IAMRole)]
+        lambda_function = next(r for r in cfn_resources if r.resource_type == "AWS::Lambda::Function")
+
+        self.assertEqual(len(generated_roles), 1)
+        self.assertEqual(
+            lambda_function.Role, {"Fn::If": ["Condition", {"Fn::GetAtt": ["fooRole", "Arn"]}, {"Ref": "iamRoleArn"}]}
+        )
+
+    def test_role_fn_if_second_no_value_creates_conditional_role(self):
+        role_conditional = {"Fn::If": ["Condition", {"Ref": "iamRoleArn"}, {"Ref": "AWS::NoValue"}]}
+        self.function.Role = role_conditional
+
+        kwargs = dict(self.kwargs)
+        kwargs["conditions"] = {"Condition": True}
+
+        cfn_resources = self.function.to_cloudformation(**self.kwargs)
+        generated_roles = [x for x in cfn_resources if isinstance(x, IAMRole)]
+        lambda_function = next(r for r in cfn_resources if r.resource_type == "AWS::Lambda::Function")
+
+        self.assertEqual(len(generated_roles), 1)
+        self.assertEqual(
+            lambda_function.Role, {"Fn::If": ["Condition", {"Ref": "iamRoleArn"}, {"Fn::GetAtt": ["fooRole", "Arn"]}]}
+        )
+
+    def test_role_get_att_no_execution_role(self):
+        role_get_att = {"Fn::GetAtt": ["MyCustomRole", "Arn"]}
+        self.function.Role = role_get_att
+
+        cfn_resources = self.function.to_cloudformation(**self.kwargs)
+        lambda_function = next(r for r in cfn_resources if r.resource_type == "AWS::Lambda::Function")
+
+        self.assertEqual(lambda_function.Role, role_get_att)
+
+    @parameterized.expand(
+        [
+            # 2-arg Fn::If (missing false value)
+            ({"Fn::If": ["Condition", "arn:aws:iam::123456789012:role/existing-role"]},),
+            # 4-arg Fn::If (extra value)
+            ({"Fn::If": ["Condition", "role_a", "role_b", "role_c"]},),
+        ]
+    )
+    def test_role_fn_if_invalid_arity_raises_invalid_resource_exception(self, malformed_role):
+        """Fn::If must have exactly 3 items: [Condition, TrueValue, FalseValue].
+        Any other arity used to crash SAM-T with a raw ValueError/IndexError,
+        which CloudFormation surfaced as "Internal transform failure".
+        It must now raise a user-facing InvalidResourceException instead.
+        """
+        self.function.Role = malformed_role
+
+        with pytest.raises(InvalidResourceException) as excinfo:
+            self.function.to_cloudformation(**self.kwargs)
+
+        msg = str(excinfo.value)
+        self.assertIn("foo", msg)  # logical id
+        self.assertIn("Role", msg)
+        self.assertIn("Fn::If", msg)
+
+    @parameterized.expand(
+        [
+            # 2-arg Fn::If (missing false value)
+            ({"Fn::If": ["SomeCondition", "queue-arn"]},),
+            # 4-arg Fn::If (extra value)
+            ({"Fn::If": ["SomeCondition", "a", "b", "c"]},),
+        ]
+    )
+    def test_destination_fn_if_invalid_arity_raises_invalid_resource_exception(self, malformed):
+        """EventInvokeConfig.DestinationConfig.{OnSuccess,OnFailure}.Destination
+        also supports Fn::If. Any list arity other than 3 previously crashed the
+        transform with IndexError in _get_or_make_condition.
+        """
+        with pytest.raises(InvalidResourceException) as excinfo:
+            self.function._get_or_make_condition(malformed, "DestLogicalId", {})
+
+        msg = str(excinfo.value)
+        self.assertIn("DestLogicalId", msg)
+        self.assertIn("Destination", msg)
+        self.assertIn("Fn::If", msg)
+
+
+class TestSamCapacityProvider(TestCase):
+    """Tests for SamCapacityProvider"""
+
+    def setUp(self):
+        self.intrinsics_resolver = IntrinsicsResolver({})
+        self.kwargs = {
+            "intrinsics_resolver": self.intrinsics_resolver,
+            "resource_resolver": ResourceResolver({}),
+        }
+
+    def test_basic_capacity_provider_without_propagate_tags(self):
+        """Test that tags are correctly set on the capacity provider"""
+        capacity_provider = SamCapacityProvider("MyCapacityProvider")
+        capacity_provider.VpcConfig = {"SubnetIds": ["subnet-123", "subnet-456"], "SecurityGroupIds": ["sg-123"]}
+        capacity_provider.Tags = {"Environment": "Production", "Project": "ServerlessApp"}
+
+        resources = capacity_provider.to_cloudformation(**self.kwargs)
+
+        # Verify the capacity provider has the expected tags
+        lambda_capacity_providers = [
+            r for r in resources if hasattr(r, "resource_type") and r.resource_type == "AWS::Lambda::CapacityProvider"
+        ]
+        self.assertEqual(len(lambda_capacity_providers), 1)
+
+        # Check that the tags are present in the capacity provider
+        tags = lambda_capacity_providers[0].Tags
+        if not tags:
+            self.fail("CapacityProvider resource generated with missing tags.")
+        self.assertEqual(sorted([tag["Key"] for tag in tags]), ["Environment", "Project", "lambda:createdBy"])
+        self.assertEqual(sorted([tag["Value"] for tag in tags]), ["Production", "SAM", "ServerlessApp"])
+
+        # Verify that IAM resources don't have user tags by default
+        iam_resources = [
+            r for r in resources if hasattr(r, "resource_type") and r.resource_type.startswith("AWS::IAM::")
+        ]
+        for resource in iam_resources:
+            if hasattr(resource, "Tags") and resource.Tags:
+                tags = resource.Tags
+                self.assertEqual([tag["Key"] for tag in tags], ["lambda:createdBy"])
+                self.assertEqual([tag["Value"] for tag in tags], ["SAM"])
+
+    def test_capacity_provider_with_propagate_tags(self):
+        """Test that tags are propagated to all resources when PropagateTags is True"""
+        capacity_provider = SamCapacityProvider("MyCapacityProvider")
+        capacity_provider.VpcConfig = {"SubnetIds": ["subnet-123", "subnet-456"], "SecurityGroupIds": ["sg-123"]}
+        capacity_provider.Tags = {"Environment": "Production", "Project": "ServerlessApp"}
+        capacity_provider.PropagateTags = True
+
+        resources = capacity_provider.to_cloudformation(**self.kwargs)
+
+        # Check that tags are propagated to all resources
+        for resource in resources:
+            if hasattr(resource, "Tags") and resource.Tags:
+                tags = resource.Tags
+                self.assertEqual(sorted([tag["Key"] for tag in tags]), ["Environment", "Project", "lambda:createdBy"])
+                self.assertEqual(sorted([tag["Value"] for tag in tags]), ["Production", "SAM", "ServerlessApp"])
+
+
+class TestFunctionPolicy(TestCase):
+    kwargs = {
+        "intrinsics_resolver": IntrinsicsResolver({}),
+        "event_resources": [],
+        "managed_policy_map": {"foo": "bar"},
+        "resource_resolver": ResourceResolver({}),
+    }
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    def test_managed_policy_name(self):
+        function = SamFunction("Foo")
+        function.CodeUri = "s3://foobar/foo.zip"
+        function.Runtime = "foo"
+        function.Handler = "bar"
+        managedPolicyName = "foo"
+        function.Policies = [managedPolicyName]
+
+        cfnResources = function.to_cloudformation(**self.kwargs)
+        iamRoles = [x for x in cfnResources if isinstance(x, IAMRole)]
+        self.assertEqual(iamRoles[0].ManagedPolicyArns[1], self.kwargs["managed_policy_map"][managedPolicyName])
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    def test_unknown_policy_name(self):
+        function = SamFunction("Foo")
+        function.CodeUri = "s3://foobar/foo.zip"
+        function.Runtime = "foo"
+        function.Handler = "bar"
+        unknownPolicyName = "bar"
+        function.Policies = [unknownPolicyName]
+
+        cfnResources = function.to_cloudformation(**self.kwargs)
+        iamRoles = [x for x in cfnResources if isinstance(x, IAMRole)]
+        self.assertEqual(iamRoles[0].ManagedPolicyArns[1], unknownPolicyName)
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    def test_managed_policy_name_within_intrinsic_if_then(self):
+        function = SamFunction("Foo")
+        function.CodeUri = "s3://foobar/foo.zip"
+        function.Runtime = "foo"
+        function.Handler = "bar"
+        managedPolicyName = "foo"
+        function.Policies = [{"Fn::If": ["Condition", managedPolicyName, {"Fn::Ref": "AWS::NoValue"}]}]
+
+        cfnResources = function.to_cloudformation(**self.kwargs)
+        iamRoles = [x for x in cfnResources if isinstance(x, IAMRole)]
+
+        self.assertIn("Fn::If", iamRoles[0].ManagedPolicyArns[1])
+        self.assertEqual(iamRoles[0].ManagedPolicyArns[1]["Fn::If"][0], "Condition")
+        self.assertEqual(
+            iamRoles[0].ManagedPolicyArns[1]["Fn::If"][1], self.kwargs["managed_policy_map"][managedPolicyName]
+        )
+        self.assertDictEqual(iamRoles[0].ManagedPolicyArns[1]["Fn::If"][2], {"Fn::Ref": "AWS::NoValue"})
+
+    @patch("boto3.session.Session.region_name", "ap-southeast-1")
+    def test_managed_policy_name_within_intrinsic_if_else(self):
+        function = SamFunction("Foo")
+        function.CodeUri = "s3://foobar/foo.zip"
+        function.Runtime = "foo"
+        function.Handler = "bar"
+        managedPolicyName = "foo"
+        function.Policies = [{"Fn::If": ["Condition", {"Fn::Ref": "AWS::NoValue"}, managedPolicyName]}]
+
+        cfnResources = function.to_cloudformation(**self.kwargs)
+        iamRoles = [x for x in cfnResources if isinstance(x, IAMRole)]
+
+        self.assertIn("Fn::If", iamRoles[0].ManagedPolicyArns[1])
+        self.assertEqual(iamRoles[0].ManagedPolicyArns[1]["Fn::If"][0], "Condition")
+        self.assertDictEqual(iamRoles[0].ManagedPolicyArns[1]["Fn::If"][1], {"Fn::Ref": "AWS::NoValue"})
+        self.assertEqual(
+            iamRoles[0].ManagedPolicyArns[1]["Fn::If"][2], self.kwargs["managed_policy_map"][managedPolicyName]
+        )
